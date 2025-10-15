@@ -1,0 +1,564 @@
+# =====================================================================
+# 📊 DASHBOARD SHINY - MÉTRICAS DO DECRETO (versão FINAL COM MELHORIAS)
+# =====================================================================
+
+# ------------------------------------------------------------
+# 🔹 Pacotes
+# ------------------------------------------------------------
+library(shiny)
+library(shinydashboard)
+library(plotly)
+library(dplyr)
+library(readr)
+library(stringr)
+library(lubridate)
+library(DT)
+library(tidyr)
+library(writexl)
+
+# ------------------------------------------------------------
+# 🔹 Funções
+# ------------------------------------------------------------
+
+carregar_metricas <- function(caminho = "métricas decreto.csv") {
+  message("📂 Lendo arquivo de métricas...")
+  dados <- read_delim(
+    caminho,
+    delim = ";",
+    locale = locale(encoding = "latin1"),
+    trim_ws = TRUE,
+    show_col_types = FALSE
+  )
+  return(dados)
+}
+
+limpar_colunas_metricas <- function(df) {
+  message("🧹 Limpando nomes e formatos...")
+  
+  nomes_limpos <- names(df) %>%
+    str_replace_all("\\s+$", "") %>%      
+    str_replace_all("\\n", "") %>%        
+    str_replace_all("\\s+", "_") %>%      
+    make.names(unique = TRUE)
+  
+  names(df) <- nomes_limpos
+  
+  if ("Data" %in% names(df)) {
+    df <- df %>% mutate(Data = suppressWarnings(dmy(Data)))
+  }
+  
+  campos_texto <- c("Justificativa", "Profissão", "Encaminhamento", "OBS", "VerificaInstituição")
+  for (campo in campos_texto) {
+    if (campo %in% names(df)) {
+      df[[campo]][is.na(df[[campo]])] <- ""
+    }
+  }
+  
+  if ("Instituição" %in% names(df)) df$Instituição <- str_to_upper(df$Instituição)
+  if ("Situação" %in% names(df)) df$Situação <- str_to_title(df$Situação)
+  if ("Status" %in% names(df)) df$Status <- str_to_title(df$Status)
+  
+  return(df)
+}
+
+# Detecta automaticamente a coluna de temas
+sumarizar_por_tema <- function(df) {
+  col_tema <- names(df)[stringr::str_detect(names(df), regex("tema", ignore_case = TRUE))][1]
+  if (is.na(col_tema)) stop("❌ Nenhuma coluna com 'Tema' encontrada!")
+  
+  df %>%
+    group_by(Tema = .data[[col_tema]]) %>%
+    summarise(
+      Total = n(),
+      Admitidas = sum(Situação == "Admitida", na.rm = TRUE),
+      Taxa_Admissão = ifelse(Total > 0, round(Admitidas/Total * 100, 1), 0),
+      .groups = "drop"
+    ) %>%
+    filter(!is.na(Tema) & Tema != "") %>%
+    arrange(desc(Total))
+}
+
+sumarizar_por_instituicao <- function(df) {
+  df %>%
+    group_by(Instituição) %>%
+    summarise(
+      Total = n(),
+      Admitidas = sum(Situação == "Admitida", na.rm = TRUE),
+      Taxa_Admissão = ifelse(Total > 0, round(Admitidas/Total * 100, 1), 0),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(Total))
+}
+
+sumarizar_por_situacao <- function(df) {
+  df %>%
+    group_by(Situação) %>%
+    summarise(Total = n(), .groups = "drop") %>%
+    arrange(desc(Total))
+}
+
+sumarizar_por_data <- function(df) {
+  df %>%
+    filter(!is.na(Data)) %>%
+    group_by(Data) %>%
+    summarise(Total = n(), .groups = "drop") %>%
+    arrange(Data)
+}
+
+# NOVA FUNÇÃO: Para gráfico radar (tema x instituição)
+sumarizar_para_radar <- function(df) {
+  col_tema <- names(df)[stringr::str_detect(names(df), regex("tema", ignore_case = TRUE))][1]
+  
+  if (is.na(col_tema)) {
+    return(data.frame())
+  }
+  
+  df %>%
+    group_by(Tema = .data[[col_tema]], Instituição) %>%
+    summarise(
+      Contribuições = n(),
+      Admitidas = sum(Situação == "Admitida", na.rm = TRUE),
+      Taxa_Admissão = ifelse(Contribuições > 0, round(Admitidas/Contribuições * 100, 1), 0),
+      .groups = "drop"
+    ) %>%
+    filter(!is.na(Tema) & Tema != "" & !is.na(Instituição) & Instituição != "")
+}
+
+gerar_metricas_resumo <- function(df) {
+  col_tema <- names(df)[stringr::str_detect(names(df), regex("tema", ignore_case = TRUE))][1]
+  
+  tibble(
+    total_contribuicoes = nrow(df),
+    total_temas = n_distinct(df[[col_tema]], na.rm = TRUE),
+    total_instituicoes = n_distinct(df$Instituição, na.rm = TRUE),
+    taxa_admissibilidade = round(
+      mean(df$Situação == "Admitida", na.rm = TRUE) * 100, 1
+    )
+  )
+}
+
+# ------------------------------------------------------------
+# 🔹 Dados
+# ------------------------------------------------------------
+dados <- carregar_metricas("métricas decreto.csv")
+dados <- limpar_colunas_metricas(dados)
+
+# ------------------------------------------------------------
+# 🔹 Interface (UI)
+# ------------------------------------------------------------
+ui <- dashboardPage(
+  skin = "blue",
+  dashboardHeader(
+    title = span(icon("chart-bar"), "Métricas do Decreto"),
+    titleWidth = 300
+  ),
+  dashboardSidebar(
+    width = 280,
+    sidebarMenu(
+      menuItem("📊 Resumo", tabName = "resumo", icon = icon("dashboard")),
+      menuItem("🔍 Análises Detalhadas", tabName = "analises", icon = icon("search")),
+      menuItem("📋 Dados", tabName = "dados", icon = icon("database")),
+      menuItem("ℹ️ Sobre", tabName = "sobre", icon = icon("info-circle"))
+    ),
+    hr(),
+    helpText("Desenvolvido com Shiny", style = "padding: 10px;")
+  ),
+  dashboardBody(
+    tags$head(tags$style(HTML("
+      .small-box { text-align: center; }
+      .box { border-radius: 8px; }
+      .content-wrapper { background-color: #f8f9fa; }
+      .download-btn { margin: 2px; font-size: 12px; }
+      .info-box-custom { 
+        background: #f8f9fa; 
+        padding: 15px; 
+        margin: 10px 0; 
+        border-radius: 5px; 
+        border-left: 4px solid #0073b7;
+      }
+    "))),
+    
+    tabItems(
+      # ------------------ RESUMO ------------------
+      tabItem(tabName = "resumo",
+              fluidRow(
+                valueBoxOutput("vb_total_contrib", width = 3),
+                valueBoxOutput("vb_total_temas", width = 3),
+                valueBoxOutput("vb_total_inst", width = 3),
+                valueBoxOutput("vb_taxa_adm", width = 3)
+              ),
+              fluidRow(
+                box(width = 6, title = "📈 Top 10 Temas", status = "primary", solidHeader = TRUE,
+                    plotlyOutput("grafico_temas")),
+                box(width = 6, title = "📊 Distribuição por Situação", status = "warning", solidHeader = TRUE,
+                    plotlyOutput("grafico_situacao"))
+              ),
+              fluidRow(
+                box(width = 12, title = "📅 Evolução Temporal", status = "info", solidHeader = TRUE,
+                    plotlyOutput("grafico_temporal"))
+              )
+      ),
+      
+      # ------------------ ANÁLISES DETALHADAS ------------------
+      tabItem(tabName = "analises",
+              fluidRow(
+                box(width = 6, title = "🏛️ Contribuições por Instituição", solidHeader = TRUE, status = "primary",
+                    plotlyOutput("grafico_instituicao")),
+                box(width = 6, title = "📋 Ranking de Instituições", solidHeader = TRUE, status = "success",
+                    div(style = "margin-bottom: 10px;",
+                        downloadButton("baixar_instituicoes_csv", "📥 CSV", class = "download-btn"),
+                        downloadButton("baixar_instituicoes_xlsx", "📥 Excel", class = "download-btn")),
+                    DTOutput("tabela_instituicoes"))
+              ),
+              fluidRow(
+                box(width = 6, title = "📊 Distribuição de Temas", status = "info", solidHeader = TRUE,
+                    plotlyOutput("grafico_temas_pizza")),
+                box(width = 6, title = "📡 Análise Radar: Temas x Instituições", status = "warning", solidHeader = TRUE,
+                    plotlyOutput("grafico_radar"))
+              )
+      ),
+      
+      # ------------------ DADOS ------------------
+      tabItem(tabName = "dados",
+              box(width = 12, title = "💾 Dados Completos", solidHeader = TRUE, status = "primary",
+                  div(style = "margin-bottom: 10px;",
+                      downloadButton("baixar_dados_csv", "📥 CSV", class = "download-btn"),
+                      downloadButton("baixar_dados_xlsx", "📥 Excel", class = "download-btn")),
+                  DTOutput("tabela_dados"))
+      ),
+      
+      # ------------------ SOBRE ------------------
+      tabItem(tabName = "sobre",
+              h2("💡 Informações sobre o Dashboard e Desenvolvimento"),
+              fluidRow(
+                box(width = 12, title = "Estrutura do Projeto", status = "info", solidHeader = TRUE,
+                    
+                    div(class = "info-box-custom",
+                        h4("Plataforma de Desenvolvimento: R"),
+                        p("Este Dashboard foi desenvolvido utilizando a linguagem de programação R, conhecida por sua excelência em análise estatística e visualização de dados. O R garante robustez no pré-processamento (limpeza, padronização e tratamento de *encoding* UTF-8) dos dados."),
+                        p(strong("Pacotes Chave:"), " `dplyr` para manipulação, `readr` para carregamento robusto, `lubridate` para datas e `stringr` para limpeza de texto.")
+                    ),
+                    
+                    div(class = "info-box-custom",
+                        h4("Framework de Aplicação Web: Shiny"),
+                        p("O pacote Shiny foi utilizado para transformar as análises do R em uma aplicação web interativa, permitindo que os usuários explorem os dados dinamicamente sem a necessidade de conhecimento em código."),
+                        p(strong("Componentes:"), "O layout utiliza o `shinydashboard` para uma interface moderna de painel de controle, e o `plotly` para gráficos interativos.")
+                    ),
+                    
+                    div(class = "info-box-custom",
+                        h4("Interatividade e Visualização"),
+                        p("As tabelas (`DT`) permitem filtros avançados e buscas, enquanto os gráficos (`plotly`) fornecem detalhes ao passar o mouse (tooltip) e são otimizados para visualização de grandes volumes de dados temporais e categóricos.")
+                    ),
+                    
+                    div(class = "info-box-custom",
+                        h4("Autoria e Contato"),
+                        p("O desenvolvimento do código e a estruturação deste Dashboard foram realizados por:"),
+                        p(strong("Autor(a): JULIANA FERNANDES FARIAS")),
+                        p(strong("Data de Criação:"), format(Sys.Date(), "%d/%m/%Y")),
+                        p(em("Este projeto visa fornecer uma visão clara e rápida sobre as métricas do decreto."))
+                    )
+                )
+              )
+      )
+    )
+  )
+)
+
+# ------------------------------------------------------------
+# 🔹 Server (Lógica)
+# ------------------------------------------------------------
+server <- function(input, output, session) {
+  
+  # Dataset filtrado para a tabela de dados completos (removendo colunas desnecessárias)
+  dados_tabela_completa <- reactive({
+    # Nomes das colunas a serem removidas (incluindo OBS)
+    colunas_a_remover <- c("Texto", "Encaminhamento", "VerificaInstituição", "OBS")
+    
+    # Remove as colunas usando dplyr::select
+    dados %>%
+      select(-any_of(colunas_a_remover))
+  })
+  
+  # Value Boxes
+  metricas_resumo <- reactive({
+    gerar_metricas_resumo(dados)
+  })
+  
+  output$vb_total_contrib <- renderValueBox({
+    metricas <- metricas_resumo()
+    valueBox(metricas$total_contribuicoes, "Total de Contribuições", icon = icon("file-text"), color = "blue")
+  })
+  
+  output$vb_total_temas <- renderValueBox({
+    metricas <- metricas_resumo()
+    valueBox(metricas$total_temas, "Total de Temas", icon = icon("tags"), color = "green")
+  })
+  
+  output$vb_total_inst <- renderValueBox({
+    metricas <- metricas_resumo()
+    valueBox(metricas$total_instituicoes, "Total de Instituições", icon = icon("university"), color = "purple")
+  })
+  
+  output$vb_taxa_adm <- renderValueBox({
+    metricas <- metricas_resumo()
+    valueBox(paste0(metricas$taxa_admissibilidade, "%"), "Taxa de Admissão", icon = icon("check-circle"), color = "yellow")
+  })
+  
+  # Gráfico de Temas (Resumo) - COM CORES E LEGENDA
+  output$grafico_temas <- renderPlotly({
+    temas_df <- sumarizar_por_tema(dados)
+    temas_top10 <- head(temas_df, 10)
+    
+    # Cores diferentes para cada tema
+    cores <- c("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+               "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf")
+    
+    plot_ly(
+      data = temas_top10,
+      x = ~Total,
+      y = ~Tema,
+      type = "bar",
+      orientation = 'h',
+      marker = list(
+        color = cores[1:nrow(temas_top10)],
+        line = list(color = 'rgba(0,0,0,0.3)', width = 1)
+      ),
+      text = ~paste("Tema:", Tema, "<br>Total:", Total),
+      hoverinfo = 'text'
+    ) %>%
+      layout(
+        xaxis = list(title = "Número de Contribuições"),
+        yaxis = list(title = "", categoryorder = "total ascending"),
+        showlegend = FALSE,
+        margin = list(l = 150)
+      )
+  })
+  
+  output$grafico_situacao <- renderPlotly({
+    situacao_df <- sumarizar_por_situacao(dados)
+    cores <- c("Admitida" = "#28a745", "Não Admitida" = "#dc3545", "Parcialmente Admitida" = "#ffc107", "Não Informado" = "#6c757d")
+    
+    plot_ly(
+      data = situacao_df,
+      labels = ~Situação,
+      values = ~Total,
+      type = "pie",
+      marker = list(colors = cores[situacao_df$Situação]),
+      textposition = "inside",
+      textinfo = "label+percent"
+    ) %>% layout(showlegend = TRUE)
+  })
+  
+  output$grafico_temporal <- renderPlotly({
+    temporal_df <- sumarizar_por_data(dados)
+    if (nrow(temporal_df) == 0) {
+      return(plotly_empty() %>% layout(title = "Sem dados temporais válidos."))
+    }
+    plot_ly(temporal_df, x = ~Data, y = ~Total, type = "scatter", mode = "lines+markers",
+            line = list(color = "#17a2b8"),
+            text = ~paste("Data:", format(Data, "%d/%m/%Y"), "<br>Contribuições:", Total),
+            hoverinfo = 'text') %>%
+      layout(xaxis = list(title = "Data"), yaxis = list(title = "Total de Contribuições"))
+  })
+  
+  # Gráfico de Instituições - COM CORES E SEM NOMES NAS BARRAS
+  output$grafico_instituicao <- renderPlotly({
+    inst_df <- sumarizar_por_instituicao(dados)
+    inst_top10 <- head(inst_df, 10)
+    
+    # Cores diferentes para cada instituição
+    cores <- c("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+               "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf")
+    
+    plot_ly(
+      data = inst_top10,
+      x = ~Total,
+      y = ~Instituição,
+      type = "bar",
+      orientation = 'h',
+      marker = list(
+        color = cores[1:nrow(inst_top10)],
+        line = list(color = 'rgba(0,0,0,0.3)', width = 1)
+      ),
+      text = ~paste("Instituição:", Instituição, "<br>Total:", Total, "<br>Taxa Admissão:", Taxa_Admissão, "%"),
+      hoverinfo = 'text'
+    ) %>%
+      layout(
+        xaxis = list(title = "Número de Contribuições"),
+        yaxis = list(title = "", showticklabels = FALSE), # Remove os nomes das barras
+        showlegend = TRUE,
+        legend = list(
+          orientation = "v",
+          x = 1.05,
+          y = 0.5,
+          xanchor = "left"
+        ),
+        margin = list(r = 200) # Espaço para a legenda
+      )
+  })
+  
+  # NOVO: Gráfico de Pizza para Temas
+  output$grafico_temas_pizza <- renderPlotly({
+    temas_df <- sumarizar_por_tema(dados)
+    temas_top10 <- head(temas_df, 10)
+    
+    # Cores para o gráfico de pizza
+    cores <- c("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+               "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf")
+    
+    plot_ly(
+      data = temas_top10,
+      labels = ~Tema,
+      values = ~Total,
+      type = "pie",
+      marker = list(colors = cores[1:nrow(temas_top10)]),
+      textposition = "inside",
+      textinfo = "label+percent",
+      hoverinfo = "label+value+percent"
+    ) %>% 
+      layout(
+        showlegend = TRUE,
+        legend = list(orientation = "h", x = 0.5, y = -0.1, xanchor = "center")
+      )
+  })
+  
+  # NOVO: Gráfico Radar para Temas x Instituições
+  output$grafico_radar <- renderPlotly({
+    radar_df <- sumarizar_para_radar(dados)
+    
+    if (nrow(radar_df) == 0) {
+      return(plotly_empty() %>% layout(title = "Sem dados suficientes para o gráfico radar."))
+    }
+    
+    # Seleciona as top 5 instituições e top 5 temas para não sobrecarregar o gráfico
+    top_instituicoes <- radar_df %>%
+      group_by(Instituição) %>%
+      summarise(Total = sum(Contribuições)) %>%
+      arrange(desc(Total)) %>%
+      head(5) %>%
+      pull(Instituição)
+    
+    top_temas <- radar_df %>%
+      group_by(Tema) %>%
+      summarise(Total = sum(Contribuições)) %>%
+      arrange(desc(Total)) %>%
+      head(5) %>%
+      pull(Tema)
+    
+    radar_filtrado <- radar_df %>%
+      filter(Instituição %in% top_instituicoes, Tema %in% top_temas)
+    
+    # Cria o gráfico radar
+    plot_ly(
+      type = 'scatterpolar',
+      fill = 'toself'
+    ) %>%
+      # Adiciona uma linha para cada instituição
+      add_trace(
+        data = radar_filtrado %>% filter(Instituição == top_instituicoes[1]),
+        r = ~Contribuições,
+        theta = ~Tema,
+        name = top_instituicoes[1],
+        fillcolor = 'rgba(31, 119, 180, 0.3)',
+        line = list(color = 'rgba(31, 119, 180, 0.8)')
+      ) %>%
+      add_trace(
+        data = radar_filtrado %>% filter(Instituição == top_instituicoes[2]),
+        r = ~Contribuições,
+        theta = ~Tema,
+        name = top_instituicoes[2],
+        fillcolor = 'rgba(255, 127, 14, 0.3)',
+        line = list(color = 'rgba(255, 127, 14, 0.8)')
+      ) %>%
+      add_trace(
+        data = radar_filtrado %>% filter(Instituição == top_instituicoes[3]),
+        r = ~Contribuições,
+        theta = ~Tema,
+        name = top_instituicoes[3],
+        fillcolor = 'rgba(44, 160, 44, 0.3)',
+        line = list(color = 'rgba(44, 160, 44, 0.8)')
+      ) %>%
+      layout(
+        polar = list(
+          radialaxis = list(
+            visible = TRUE,
+            range = c(0, max(radar_filtrado$Contribuições, na.rm = TRUE))
+          )
+        ),
+        showlegend = TRUE
+      )
+  })
+  
+  # Tabelas
+  dt_options <- list(
+    pageLength = 10, 
+    scrollX = TRUE,
+    language = list(url = '//cdn.datatables.net/plug-ins/1.10.11/i18n/Portuguese-Brasil.json')
+  )
+  
+  output$tabela_instituicoes <- renderDT({ 
+    datatable(
+      sumarizar_por_instituicao(dados), 
+      rownames = FALSE, 
+      options = c(dt_options, list(dom = 'tip')) 
+    ) %>% 
+      formatStyle('Taxa_Admissão',
+                  backgroundColor = styleInterval(c(30, 70), c('#ffcccc', '#ffffcc', '#ccffcc')))
+  })
+  
+  # Tabela de Dados Completos - COM CORES POR TEMA
+  output$tabela_dados <- renderDT({ 
+    dados_para_exibir <- dados_tabela_completa()
+    
+    # Identifica a coluna de tema
+    col_tema <- names(dados_para_exibir)[stringr::str_detect(names(dados_para_exibir), regex("tema", ignore_case = TRUE))][1]
+    
+    if (!is.na(col_tema)) {
+      # Cria a tabela com formatação condicional por tema
+      datatable(
+        dados_para_exibir,
+        options = dt_options,
+        filter = 'top',
+        rownames = FALSE
+      ) %>%
+        formatStyle(
+          col_tema,
+          backgroundColor = styleEqual(
+            unique(dados_para_exibir[[col_tema]]),
+            colorRampPalette(c("#e3f2fd", "#bbdefb", "#90caf9", "#64b5f6", "#42a5f5"))(length(unique(dados_para_exibir[[col_tema]])))
+          )
+        )
+    } else {
+      datatable(
+        dados_para_exibir,
+        options = dt_options,
+        filter = 'top',
+        rownames = FALSE
+      )
+    }
+  })
+  
+  # Downloads
+  output$baixar_instituicoes_csv <- downloadHandler(
+    filename = function() paste0("instituicoes_", Sys.Date(), ".csv"),
+    content = function(file) write_csv(sumarizar_por_instituicao(dados), file)
+  )
+  output$baixar_instituicoes_xlsx <- downloadHandler(
+    filename = function() paste0("instituicoes_", Sys.Date(), ".xlsx"),
+    content = function(file) write_xlsx(sumarizar_por_instituicao(dados), file)
+  )
+  
+  output$baixar_dados_csv <- downloadHandler(
+    filename = function() paste0("dados_completos_", Sys.Date(), ".csv"),
+    content = function(file) write_csv(dados, file)
+  )
+  output$baixar_dados_xlsx <- downloadHandler(
+    filename = function() paste0("dados_completos_", Sys.Date(), ".xlsx"),
+    content = function(file) write_xlsx(dados, file)
+  )
+}
+
+# ------------------------------------------------------------
+# 🔹 Executar app
+# ------------------------------------------------------------
+shinyApp(ui, server)
